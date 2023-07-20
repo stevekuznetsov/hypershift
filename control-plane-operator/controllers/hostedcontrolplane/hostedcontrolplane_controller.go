@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/kms"
 	"github.com/blang/semver"
 	"github.com/go-logr/logr"
+	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	hyperv1 "github.com/openshift/hypershift/api/hypershift/v1beta1"
 	awsutil "github.com/openshift/hypershift/cmd/infra/aws/util"
@@ -71,6 +72,7 @@ import (
 	"github.com/openshift/hypershift/support/releaseinfo"
 	"github.com/openshift/hypershift/support/upsert"
 	"github.com/openshift/hypershift/support/util"
+	"github.com/openshift/library-go/pkg/operator/configobserver/featuregates"
 	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -1098,10 +1100,34 @@ func (r *HostedControlPlaneReconciler) reconcile(ctx context.Context, hostedCont
 		return fmt.Errorf("failed to reconcile cloud controller manager: %w", err)
 	}
 
-	// Reconcile cloud credential operator
-	r.Log.Info("Reconciling Cloud Credential Operator")
-	if err := r.reconcileCloudCredentialOperator(ctx, hostedControlPlane, releaseImageProvider, createOrUpdate); err != nil {
-		return fmt.Errorf("failed to reconcile cloud controller manager: %w", err)
+	// We need to reconcile the CCO if and only if the hosted control plane has the STS feature flag enabled.
+	// Generally, users will have chosen to turn this flag on by opting into the TechPreviewNoUpgrade feature
+	// set, the definition of which depends on the version of the cluster that's running. Therefore, the best
+	// and most correct way to detect whether this feature gate is on would be to reach out to the tenant and
+	// read feature gates from the API. However, we can't afford the client throughput that would be required
+	// to read this much data from each tenant here.
+	//
+	// Therefore, we make a simplifying assumption - use our vendored version of the OpenShift config API to
+	// infer whether the feature set includes the STS flag or not. This means that there will be a period of
+	// time where the tenant clusters have STS enabled but HCP doesn't know, but that's fine. We can re-vendor
+	// the repo at a later date and clarify the logic here at that point.
+	var shouldReconcileCCO bool
+	featureGatesConfigured := hostedControlPlane.Spec.Configuration != nil && hostedControlPlane.Spec.Configuration.FeatureGate != nil
+	if featureGatesConfigured {
+		featureGates := hostedControlPlane.Spec.Configuration.FeatureGate
+		featureSet := configv1.FeatureSets[featureGates.FeatureSet]
+		if featuregates.NewFeatureGate(featureSet.Enabled, featureSet.Disabled).Enabled(configv1.FeatureGateAWSSecurityTokenService) {
+			shouldReconcileCCO = true
+		} else if featureSet := featureGates.CustomNoUpgrade; featureSet != nil {
+			shouldReconcileCCO = featuregates.NewFeatureGate(featureSet.Enabled, featureSet.Disabled).Enabled(configv1.FeatureGateAWSSecurityTokenService)
+		}
+	}
+	if shouldReconcileCCO {
+		// Reconcile cloud credential operator
+		r.Log.Info("Reconciling Cloud Credential Operator")
+		if err := r.reconcileCloudCredentialOperator(ctx, hostedControlPlane, releaseImageProvider, createOrUpdate); err != nil {
+			return fmt.Errorf("failed to reconcile cloud controller manager: %w", err)
+		}
 	}
 
 	// Reconcile OLM

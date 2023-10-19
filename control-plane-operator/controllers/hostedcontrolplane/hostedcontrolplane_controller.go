@@ -14,6 +14,9 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/openshift/library-go/pkg/operator/v1helpers"
+	"k8s.io/apiserver/pkg/authentication/user"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
@@ -68,6 +71,10 @@ import (
 	"github.com/openshift/hypershift/support/releaseinfo"
 	"github.com/openshift/hypershift/support/upsert"
 	"github.com/openshift/hypershift/support/util"
+	"github.com/openshift/library-go/pkg/controller/factory"
+	"github.com/openshift/library-go/pkg/operator/certrotation"
+	"github.com/openshift/library-go/pkg/operator/events"
+	librarygoevents "github.com/openshift/library-go/pkg/operator/events"
 	prometheusoperatorv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -81,6 +88,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/duration"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
+	corev1informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/workqueue"
@@ -162,6 +170,19 @@ type HostedControlPlaneReconciler struct {
 	ec2Client                     ec2iface.EC2API
 	awsSession                    *session.Session
 	reconcileInfrastructureStatus func(ctx context.Context, hcp *hyperv1.HostedControlPlane) (InfrastructureStatus, error)
+
+	KubeClient        kubernetes.Interface
+	OperatorClient    v1helpers.StaticPodOperatorClient
+	Recorder          librarygoevents.Recorder
+	Namespace         string
+	SecretInformer    corev1informers.SecretInformer
+	SecretLister      corev1listers.SecretLister
+	ConfigMapInformer corev1informers.ConfigMapInformer
+	ConfigMapLister   corev1listers.ConfigMapLister
+	CertRotationScale time.Duration
+	Context           context.Context
+
+	certRotationControllersByHCP map[types.NamespacedName]map[string]factory.Controller
 }
 
 func (r *HostedControlPlaneReconciler) SetupWithManager(mgr ctrl.Manager, createOrUpdate upsert.CreateOrUpdateFN) error {
@@ -281,6 +302,10 @@ func (r *HostedControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.R
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
+		return ctrl.Result{}, err
+	}
+
+	if err := r.ensureCertRotationControllers(hostedControlPlane); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -4258,4 +4283,55 @@ func (r *HostedControlPlaneReconciler) reconcileSREMetricsConfig(ctx context.Con
 		r.SREConfigHash = currentMetricsSetConfigHash
 	}
 	return nil
+}
+
+const defaultRotationDay time.Duration = 24 * time.Hour
+
+func (r *HostedControlPlaneReconciler) ensureCertRotationControllers(hcp *hyperv1.HostedControlPlane) {
+	if _, ok := r.certRotationControllersByHCP[client.ObjectKeyFromObject(hcp)]; !ok {
+		r.certRotationControllersByHCP[client.ObjectKeyFromObject(hcp)] = map[string]factory.Controller{}
+	}
+
+	name := "CustomerAdminKubeconfig"
+	if _, ok := r.certRotationControllersByHCP[client.ObjectKeyFromObject(hcp)][name]; !ok {
+		rotator := certrotation.NewCertRotationController(
+			name+"Signer",
+			certrotation.RotatedSigningCASecret{
+				Namespace:     r.Namespace,
+				Name:          name + "Signer",
+				Validity:      14 * defaultRotationDay,
+				Refresh:       5 * defaultRotationDay,
+				Informer:      r.SecretInformer,
+				Lister:        r.SecretLister,
+				Client:        r.KubeClient.CoreV1(),
+				EventRecorder: r.Recorder,
+			},
+			certrotation.CABundleConfigMap{
+				Namespace:     r.Namespace,
+				Name:          name + "Signer-ca",
+				Informer:      r.ConfigMapInformer,
+				Lister:        r.ConfigMapLister,
+				Client:        r.KubeClient.CoreV1(),
+				EventRecorder: r.Recorder,
+			},
+			certrotation.RotatedSelfSignedCertKeySecret{
+				Namespace: r.Namespace,
+				Name:      name + "-client-cert-key",
+				Validity:  7 * r.CertRotationScale,
+				Refresh:   1 * r.CertRotationScale,
+				//RefreshOnlyWhenExpired: refreshOnlyWhenExpired, // TODO: how to plumb?
+				CertCreator: &certrotation.ClientRotation{
+					UserInfo: &user.DefaultInfo{Name: "system:control-plane-node-admin", Groups: []string{"system:masters"}},
+				},
+				Informer:      r.SecretInformer,
+				Lister:        r.SecretLister,
+				Client:        r.KubeClient.CoreV1(),
+				EventRecorder: r.Recorder,
+			},
+			r.OperatorClient,
+			r.Recorder,
+		)
+		r.certRotationControllersByHCP[client.ObjectKeyFromObject(hcp)][name] = rotator
+		go rotator.Run(r.Context, 1) // TODO: plumb workers
+	}
 }
